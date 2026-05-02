@@ -28,6 +28,7 @@ from .town_data import (
     FIREWORK_DESCRIPTIONS, FOOD_NPC,
     FISH_PRICES, SHELL_PRICES, GARDEN_PLANTS, NPC_JOBS,
     STALL_PRICE_MULTIPLIER, EXCHANGE_CATALOG,
+    NPC_DAY_OFF_REASONS, NPC_WORK_RATE,
 )
 
 TARGET_QQ = ""
@@ -106,9 +107,19 @@ class SeasideTown(Star):
             tp = TIME_PERIODS.get(s.get("time_period", "morning"), {})
             loc = s.get("location", "听潮街")
 
-            # 附近NPC
-            npcs_here = [f"{n['title']}·{name}" for name, n in self.all_npcs.items() if n["location"] == loc]
-            npc_line = "、".join(npcs_here) if npcs_here else "无"
+            # 附近NPC（含休息状态）
+            npcs_in = []
+            npcs_off = []
+            for name, n in self.all_npcs.items():
+                if n["location"] == loc:
+                    avail, _ = self._is_npc_available(name)
+                    if avail:
+                        npcs_in.append(f"{n['title']}·{name}")
+                    else:
+                        npcs_off.append(f"{name}（休息）")
+            npc_line = "、".join(npcs_in) if npcs_in else "无"
+            if npcs_off:
+                npc_line += f" · 休息：{'、'.join(npcs_off)}"
 
             # 背包摘要（最多显示5个）
             bp = s.get("backpack", [])
@@ -372,6 +383,26 @@ class SeasideTown(Star):
             return random.choice(RANDOM_EVENTS[location])
         return None
 
+    def _is_npc_available(self, npc_name: str) -> tuple[bool, str]:
+        """检查NPC今天是否上班。返回(是否在, 不在的理由)"""
+        rate = NPC_WORK_RATE.get(npc_name, 0.8)
+        seed = hashlib.md5(f"{self._today()}{npc_name}".encode()).hexdigest()
+        rng = random.Random(seed)
+        if rng.random() < rate:
+            return True, ""
+        reasons = NPC_DAY_OFF_REASONS.get(npc_name, [f"{npc_name}今天不在。"])
+        return False, rng.choice(reasons)
+
+    def _get_available_npcs(self, location: str) -> list[tuple[str, dict]]:
+        """获取指定地点今天在的NPC"""
+        result = []
+        for name, npc in self.all_npcs.items():
+            if npc["location"] == location:
+                available, _ = self._is_npc_available(name)
+                if available:
+                    result.append((name, npc))
+        return result
+
     def _header(self) -> str:
         """状态栏"""
         w = WEATHERS[self.state["weather"]]
@@ -394,8 +425,18 @@ class SeasideTown(Star):
         desc = self._get_scene_desc(loc)
         day = self.state["day_count"]
 
-        npcs_here = [f"{n['title']}·{name}" for name, n in self.all_npcs.items() if n["location"] == loc]
-        npc_line = f"👥 {', '.join(npcs_here)}" if npcs_here else "👥 这里没有人"
+        npcs_in = []
+        npcs_off = []
+        for name, n in self.all_npcs.items():
+            if n["location"] == loc:
+                available, reason = self._is_npc_available(name)
+                if available:
+                    npcs_in.append(f"{n['title']}·{name}")
+                else:
+                    npcs_off.append(f"{name}（休息）")
+        npc_line = f"👥 {', '.join(npcs_in)}" if npcs_in else "👥 今天这里没人在"
+        if npcs_off:
+            npc_line += f"\n😴 {'、'.join(npcs_off)}"
 
         actions = LOCATIONS[loc].get("available_actions", [])
         action_line = f"可做：{'·'.join(actions)}" if actions else ""
@@ -539,6 +580,12 @@ class SeasideTown(Star):
 
         if npc["location"] != self.state["location"]:
             yield event.plain_result(f"⚠️ {npc_name}在{npc['location']}，你现在在{self.state['location']}")
+            return
+
+        # 检查NPC今天是否在
+        available, reason = self._is_npc_available(npc_name)
+        if not available:
+            yield event.plain_result(f"😴 {reason}")
             return
 
         meet_count = self.state["npc_memory"].get(npc_name, 0)
@@ -1312,16 +1359,24 @@ class SeasideTown(Star):
                 return
 
         loc = self.state["location"]
-        npcs_here = [name for name, n in self.all_npcs.items() if n["location"] == loc]
 
+        # 只找今天上班的NPC
         available_jobs = []
-        for npc_name in npcs_here:
-            if npc_name in NPC_JOBS:
-                for job in NPC_JOBS[npc_name]:
-                    available_jobs.append((npc_name, job))
+        off_npcs = []
+        for name, n in self.all_npcs.items():
+            if n["location"] == loc and name in NPC_JOBS:
+                available, reason = self._is_npc_available(name)
+                if available:
+                    for job in NPC_JOBS[name]:
+                        available_jobs.append((name, job))
+                else:
+                    off_npcs.append(reason)
 
         if not available_jobs:
-            yield event.plain_result("⚠️ 这里没有活儿可以干…换个地方看看？")
+            msg = "⚠️ 这里今天没有活儿可以干…"
+            if off_npcs:
+                msg += "\n\n" + "\n".join(f"😴 {r}" for r in off_npcs)
+            yield event.plain_result(msg)
             return
 
         msg = event.message_str.strip()
