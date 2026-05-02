@@ -29,6 +29,9 @@ from .town_data import (
     FISH_PRICES, SHELL_PRICES, GARDEN_PLANTS, NPC_JOBS,
     STALL_PRICE_MULTIPLIER, EXCHANGE_CATALOG,
     NPC_DAY_OFF_REASONS, NPC_WORK_RATE,
+    BANK_INTEREST_RATE, BANK_NAME,
+    LOTTERY_PRICE, LOTTERY_NAME, LOTTERY_PRIZES,
+    FINANCIAL_EVENTS,
 )
 
 TARGET_QQ = ""
@@ -79,6 +82,9 @@ class SeasideTown(Star):
             "stall_items": [],
             "jobs_today": [],
             "total_earned": 0,
+            "bank_deposit": 0,
+            "bank_day": 0,
+            "lottery_history": [],
         }
 
     def _load(self, path, default) -> dict:
@@ -521,6 +527,11 @@ class SeasideTown(Star):
         if event_text:
             lines.append("")
             lines.append(f"✨ {event_text}")
+
+        fin_event = self._check_financial_event()
+        if fin_event:
+            lines.append("")
+            lines.append(fin_event)
 
         self._save_state()
         yield event.plain_result("\n".join(lines))
@@ -1985,6 +1996,197 @@ class SeasideTown(Star):
             f"💌 已通知枔枔～"
         )
 
+    # ╔═══════════════════════════════════════╗
+    # ║  银行 & 彩票                           ║
+    # ╚═══════════════════════════════════════╝
+
+    @filter.command("银行")
+    async def bank(self, event: AstrMessageEvent):
+        """
+        /银行         → 查看存款和利息
+        /银行 存 金额  → 存入
+        /银行 取 金额  → 取出（含利息）
+        """
+        if not self._check_perm(event):
+            return
+
+        msg = event.message_str.strip()
+        parts = msg.split()
+        self._calc_bank_interest()
+
+        if len(parts) == 1:
+            deposit = self.state.get("bank_deposit", 0)
+            yield event.plain_result(
+                f"🏦 {BANK_NAME}\n"
+                f"━" * 22 + "\n"
+                f"💰 存款：¥{deposit:.0f}\n"
+                f"📈 日利率：{BANK_INTEREST_RATE * 100:.0f}%（每游戏日复利）\n"
+                f"💰 身上：¥{self.state['money']}\n"
+                f"━" * 22 + "\n"
+                f"银行 存 金额 · 银行 取 金额"
+            )
+            return
+
+        if len(parts) < 3:
+            yield event.plain_result("📝 格式：银行 存/取 金额")
+            return
+
+        action = parts[1]
+        try:
+            amount = int(parts[2])
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            yield event.plain_result("⚠️ 金额必须是正整数")
+            return
+
+        if action == "存":
+            if amount > self.state["money"]:
+                yield event.plain_result(f"💰 身上只有¥{self.state['money']}")
+                return
+            self.state["money"] -= amount
+            self.state["bank_deposit"] = self.state.get("bank_deposit", 0) + amount
+            self.state["bank_day"] = self.state.get("day_count", 1)
+            self._add_diary(f"往{BANK_NAME}存了¥{amount}")
+            self._save_state()
+            yield event.plain_result(
+                f"🏦 存入¥{amount}\n"
+                f"存款：¥{self.state['bank_deposit']:.0f} · 身上：¥{self.state['money']}"
+            )
+        elif action == "取":
+            deposit = self.state.get("bank_deposit", 0)
+            if amount > deposit:
+                yield event.plain_result(f"🏦 存款只有¥{deposit:.0f}")
+                return
+            self.state["bank_deposit"] = deposit - amount
+            self.state["money"] += amount
+            self._add_diary(f"从{BANK_NAME}取了¥{amount}")
+            self._save_state()
+            yield event.plain_result(
+                f"🏦 取出¥{amount}\n"
+                f"存款：¥{self.state['bank_deposit']:.0f} · 身上：¥{self.state['money']}"
+            )
+        else:
+            yield event.plain_result("📝 格式：银行 存/取 金额")
+
+    def _calc_bank_interest(self):
+        """结算银行利息（按游戏天数复利）"""
+        deposit = self.state.get("bank_deposit", 0)
+        if deposit <= 0:
+            return
+        last_day = self.state.get("bank_day", self.state.get("day_count", 1))
+        current_day = self.state.get("day_count", 1)
+        days_passed = current_day - last_day
+        if days_passed > 0:
+            interest = deposit * ((1 + BANK_INTEREST_RATE) ** days_passed - 1)
+            self.state["bank_deposit"] = deposit + interest
+            self.state["bank_day"] = current_day
+            if interest >= 1:
+                self._add_diary(f"{BANK_NAME}利息到账¥{interest:.0f}")
+
+    @filter.command("彩票")
+    async def lottery(self, event: AstrMessageEvent):
+        """
+        /彩票 1 5 9  → 选3个数字(1-9)，每注¥100
+        /彩票 随机    → 随机选号
+        """
+        if not self._check_perm(event):
+            return
+
+        if self.state["location"] != "听潮街":
+            yield event.plain_result("⚠️ 彩票站在听潮街")
+            return
+
+        msg = event.message_str.strip()
+        parts = msg.split()
+
+        if len(parts) == 1:
+            yield event.plain_result(
+                f"🎰 {LOTTERY_NAME}\n"
+                f"━" * 22 + "\n"
+                f"每注¥{LOTTERY_PRICE}，选3个数字（1-9）\n"
+                f"3中3 → {LOTTERY_PRIZES[3]['multiplier']}倍（¥{LOTTERY_PRICE * LOTTERY_PRIZES[3]['multiplier']}）\n"
+                f"3中2 → {LOTTERY_PRIZES[2]['multiplier']}倍（¥{LOTTERY_PRICE * LOTTERY_PRIZES[2]['multiplier']}）\n"
+                f"3中1 → {LOTTERY_PRIZES[1]['multiplier']}倍（¥{int(LOTTERY_PRICE * LOTTERY_PRIZES[1]['multiplier'])}）\n"
+                f"3中0 → 血本无归\n"
+                f"━" * 22 + "\n"
+                f"彩票 数字 数字 数字 · 彩票 随机\n"
+                f"💰 余额：¥{self.state['money']}"
+            )
+            return
+
+        if self.state["money"] < LOTTERY_PRICE:
+            yield event.plain_result(f"💰 每注¥{LOTTERY_PRICE}，你只有¥{self.state['money']}。先去打工吧。")
+            return
+
+        if parts[1] == "随机":
+            my_nums = sorted(random.sample(range(1, 10), 3))
+        else:
+            try:
+                my_nums = sorted([int(x) for x in parts[1:4]])
+                if len(my_nums) != 3 or any(n < 1 or n > 9 for n in my_nums):
+                    raise ValueError
+                if len(set(my_nums)) != 3:
+                    yield event.plain_result("⚠️ 三个数字不能重复")
+                    return
+            except (ValueError, IndexError):
+                yield event.plain_result("⚠️ 选3个不同的数字（1-9）\n例：彩票 2 5 8")
+                return
+
+        self.state["money"] -= LOTTERY_PRICE
+        winning_nums = sorted(random.sample(range(1, 10), 3))
+        matches = len(set(my_nums) & set(winning_nums))
+        prize = LOTTERY_PRIZES[matches]
+        winnings = int(LOTTERY_PRICE * prize["multiplier"])
+        self.state["money"] += winnings
+        net = winnings - LOTTERY_PRICE
+
+        self.state.setdefault("lottery_history", []).append({
+            "date": self._today(),
+            "my_nums": my_nums,
+            "winning_nums": winning_nums,
+            "matches": matches,
+            "net": net,
+        })
+        if net > 0:
+            self.state["total_earned"] = self.state.get("total_earned", 0) + net
+            self._add_diary(f"买彩票中了{prize['name']}！赚了¥{net}")
+        elif net == 0:
+            self._add_diary("买彩票保本了")
+        else:
+            self._add_diary(f"买彩票亏了¥{LOTTERY_PRICE}")
+        self._save_state()
+
+        yield event.plain_result(
+            f"🎰 {LOTTERY_NAME}\n"
+            f"━" * 22 + "\n"
+            f"你选的：{' '.join(str(n) for n in my_nums)}\n"
+            f"开奖号：{' '.join(str(n) for n in winning_nums)}\n"
+            f"中了：{matches}个 → {prize['name']}！\n\n"
+            f"{prize['desc']}\n"
+            f"━" * 22 + "\n"
+            f"{'💰' if net >= 0 else '💸'} {'+'if net >= 0 else ''}{net}  ·  余额：¥{self.state['money']}"
+        )
+
+    def _check_financial_event(self) -> str | None:
+        """8%概率触发金融随机事件"""
+        if random.random() > 0.08:
+            return None
+        evt = random.choice(FINANCIAL_EVENTS)
+        if evt["type"] in ("bonus", "windfall"):
+            self.state["money"] += evt["amount"]
+            self.state["total_earned"] = self.state.get("total_earned", 0) + evt["amount"]
+            return f"{evt['desc']}\n💰 +¥{evt['amount']}"
+        elif evt["type"] == "loss":
+            loss = min(evt["amount"], self.state["money"])
+            self.state["money"] -= loss
+            return f"{evt['desc']}\n💸 -¥{loss}"
+        elif evt["type"] == "tax":
+            tax = max(int(self.state["money"] * evt["percent"] / 100), 1)
+            self.state["money"] -= tax
+            return f"{evt['desc']}\n💸 -¥{tax}"
+        return None
+
     # ═══════════════════════════════════════
     #  /沉星湾帮助
     # ═══════════════════════════════════════
@@ -2005,11 +2207,11 @@ class SeasideTown(Star):
             "【邮局】\n"
             "写信 内容 · 明信片 · 信箱\n"
             "【赚钱】\n"
-            "卖 物品 · 打工 · 摆摊 · 除草\n"
+            "卖 物品 · 打工 · 下班 · 喊回来 · 摆摊 · 除草\n"
             "【花园】\n"
             "种花 · 花园 · 收花\n"
-            "【存钱罐】\n"
-            "存钱 · 取钱 · 兑换\n"
+            "【金融】\n"
+            "存钱 · 取钱 · 兑换 · 银行 · 彩票\n"
             "【系统】\n"
             "背包 · 日记 · 漫游 · 自动漫游 · 新的一天\n"
             "━" * 22 + "\n"
