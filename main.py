@@ -1198,11 +1198,75 @@ class SeasideTown(Star):
         self._add_diary(f"{job['task']}，赚了¥{pay}")
         self._save_state()
 
+        # 尝试用AI生成打工场景
+        ai_desc = await self._generate_job_scene(npc_name, job)
+        desc = ai_desc if ai_desc else job["desc"]
+
         yield event.plain_result(
             f"🔨 {job['task']}\n"
-            f"{job['desc']}\n\n"
+            f"{desc}\n\n"
             f"💰 +¥{pay} · 余额：¥{self.state['money']}"
         )
+
+    async def _generate_job_scene(self, npc_name: str, job: dict) -> str | None:
+        """用API生成打工场景描写，省沈砚清的token"""
+        if self.npc_mode == "card":
+            return None
+
+        npc = self.all_npcs.get(npc_name, {})
+        w = WEATHERS[self.state["weather"]]
+        tp = TIME_PERIODS[self.state["time_period"]]
+
+        prompt = (
+            f"你在写一个海边小镇的场景。用2-3句话描写以下打工场景，要有画面感，有细节，像小说。\n"
+            f"NPC：{npc_name}（{npc.get('title', '')}），性格：{npc.get('personality', '')[:30]}\n"
+            f"任务：{job['task']}\n"
+            f"天气：{w['name']}，时间：{tp['name']}\n"
+            f"只输出场景描写，不要加旁白或说明。"
+        )
+
+        messages = [
+            {"role": "system", "content": "你是一个擅长写短场景的作者。简洁，有画面感，有温度。"},
+            {"role": "user", "content": prompt},
+        ]
+
+        if self.npc_mode == "provider" and self.npc_provider_id:
+            try:
+                llm_resp = await self.context.llm_generate(
+                    chat_provider_id=self.npc_provider_id,
+                    prompt=messages,
+                )
+                return llm_resp.completion_text
+            except Exception as e:
+                logger.error(f"打工场景生成失败(provider): {e}")
+                return None
+
+        if self.npc_mode == "api" and self.npc_api_base and self.npc_api_key:
+            try:
+                url = f"{self.npc_api_base.rstrip('/')}/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {self.npc_api_key}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "model": self.npc_model,
+                    "messages": messages,
+                    "max_tokens": 150,
+                    "temperature": 0.9,
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            return data["choices"][0]["message"]["content"]
+                        else:
+                            logger.error(f"打工场景API返回 {resp.status}")
+                            return None
+            except Exception as e:
+                logger.error(f"打工场景生成失败(api): {e}")
+                return None
+
+        return None
 
     # ═══════════════════════════════════════
     #  /种花 花名
