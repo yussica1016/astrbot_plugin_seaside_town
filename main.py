@@ -17,7 +17,7 @@ import aiohttp
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+from astrbot.api import logger, AstrBotConfig
 
 from .town_data import (
     LOCATIONS, LOCATION_ALIASES, NPCS, SHOP_ITEMS,
@@ -36,7 +36,7 @@ INITIAL_MONEY = 100
 @register("seaside_town", "叶枔枖 & 叶克宝",
           "沉星湾 v1.0 - 设计叶枔枖 & 沈砚清，编写叶克宝。", "1.0.0")
 class SeasideTown(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         base = os.path.dirname(os.path.abspath(__file__))
         self.state_path = os.path.join(base, "town_state.json")
@@ -48,11 +48,12 @@ class SeasideTown(Star):
         # 合并食堂NPC到主NPC表
         self.all_npcs = {**NPCS, **FOOD_NPC}
         # 读取插件配置
-        self.npc_mode = self.context.config.get("npc_mode", "card")
-        self.npc_provider_id = self.context.config.get("npc_provider_id", "")
-        self.npc_api_base = self.context.config.get("npc_api_base", "")
-        self.npc_api_key = self.context.config.get("npc_api_key", "")
-        self.npc_model = self.context.config.get("npc_model", "deepseek-chat")
+        self.config = config or {}
+        self.npc_mode = self.config.get("npc_mode", "card")
+        self.npc_provider_id = self.config.get("npc_provider_id", "")
+        self.npc_api_base = self.config.get("npc_api_base", "")
+        self.npc_api_key = self.config.get("npc_api_key", "")
+        self.npc_model = self.config.get("npc_model", "deepseek-chat")
 
     # ═══════════════════════════════════════
     #  数据管理
