@@ -1,0 +1,32 @@
+[
+  {
+    "name": "npc_mode",
+    "description": "NPC对话模式：card=只输出角色卡(默认)，provider=用AstrBot已配置的模型，api=用独立API",
+    "type": "string",
+    "default": "card"
+  },
+  {
+    "name": "npc_provider_id",
+    "description": "【provider模式】AstrBot里配置的模型ID，例如 deepseek-chat。在WebUI的「接入AI」里查看。",
+    "type": "string",
+    "default": ""
+  },
+  {
+    "name": "npc_api_base",
+    "description": "【api模式】OpenAI兼容的API地址，例如 https://api.deepseek.com/v1",
+    "type": "string",
+    "default": ""
+  },
+  {
+    "name": "npc_api_key",
+    "description": "【api模式】API密钥",
+    "type": "string",
+    "default": ""
+  },
+  {
+    "name": "npc_model",
+    "description": "【api模式】模型名称，例如 deepseek-chat",
+    "type": "string",
+    "default": "deepseek-chat"
+  }
+]

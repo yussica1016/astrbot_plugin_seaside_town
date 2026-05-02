@@ -13,6 +13,7 @@ import hashlib
 import logging
 from datetime import datetime, timezone, timedelta
 from copy import deepcopy
+import aiohttp
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
@@ -40,10 +41,18 @@ class SeasideTown(Star):
         base = os.path.dirname(os.path.abspath(__file__))
         self.state_path = os.path.join(base, "town_state.json")
         self.mail_path = os.path.join(base, "mailbox.json")
+        self.npc_history_path = os.path.join(base, "npc_history.json")
         self.state = self._load(self.state_path, self._default_state())
         self.mailbox = self._load(self.mail_path, {"letters": [], "postcards": []})
+        self.npc_history = self._load(self.npc_history_path, {})
         # 合并食堂NPC到主NPC表
         self.all_npcs = {**NPCS, **FOOD_NPC}
+        # 读取插件配置
+        self.npc_mode = self.context.config.get("npc_mode", "card")
+        self.npc_provider_id = self.context.config.get("npc_provider_id", "")
+        self.npc_api_base = self.context.config.get("npc_api_base", "")
+        self.npc_api_key = self.context.config.get("npc_api_key", "")
+        self.npc_model = self.context.config.get("npc_model", "deepseek-chat")
 
     # ═══════════════════════════════════════
     #  数据管理
@@ -85,6 +94,114 @@ class SeasideTown(Star):
                 json.dump(self.mailbox, f, ensure_ascii=False, indent=2)
         except IOError as e:
             logger.error(f"保存信箱失败: {e}")
+
+    def _save_npc_history(self):
+        try:
+            with open(self.npc_history_path, "w", encoding="utf-8") as f:
+                json.dump(self.npc_history, f, ensure_ascii=False, indent=2)
+        except IOError as e:
+            logger.error(f"保存NPC历史失败: {e}")
+
+    async def _call_npc_ai(self, npc_name: str, npc: dict, user_msg: str = "") -> str | None:
+        """调用AI生成NPC对话。返回NPC的台词，失败返回None。"""
+
+        # 构建system prompt
+        w = WEATHERS[self.state["weather"]]
+        tp = TIME_PERIODS[self.state["time_period"]]
+        meet_count = self.state["npc_memory"].get(npc_name, 0)
+
+        system_prompt = (
+            f"你正在扮演沉星湾小镇的一个角色。\n"
+            f"角色名：{npc_name}\n"
+            f"身份：{npc['title']}\n"
+            f"性格：{npc['personality']}\n"
+            f"话题：{npc['topics']}\n"
+            f"当前位置：{npc['location']}\n"
+            f"天气：{w['name']}\n"
+            f"时间：{tp['name']}\n"
+            f"这是你们第{meet_count + 1}次见面。\n\n"
+            f"要求：\n"
+            f"- 完全沉浸在角色中，用角色的口吻说话\n"
+            f"- 回复简短自然，像真实对话，一般2-4句话\n"
+            f"- 符合角色性格（话少的角色就少说，话多的就多说）\n"
+            f"- 可以提到小镇里的其他人和事\n"
+            f"- 不要加任何旁白、动作描写或括号说明\n"
+            f"- 只输出角色说的话"
+        )
+
+        # 获取对话历史
+        history = self.npc_history.get(npc_name, [])
+        messages = [{"role": "system", "content": system_prompt}]
+        # 最近10轮对话
+        for h in history[-10:]:
+            messages.append(h)
+        if user_msg:
+            messages.append({"role": "user", "content": user_msg})
+        else:
+            messages.append({"role": "user", "content": "(走过来打招呼)"})
+
+        # 模式1：使用AstrBot内置provider
+        if self.npc_mode == "provider" and self.npc_provider_id:
+            try:
+                llm_resp = await self.context.llm_generate(
+                    chat_provider_id=self.npc_provider_id,
+                    prompt=messages,
+                )
+                reply = llm_resp.completion_text
+                # 保存对话历史
+                if user_msg:
+                    history.append({"role": "user", "content": user_msg})
+                else:
+                    history.append({"role": "user", "content": "(打招呼)"})
+                history.append({"role": "assistant", "content": reply})
+                if len(history) > 20:
+                    history = history[-20:]
+                self.npc_history[npc_name] = history
+                self._save_npc_history()
+                return reply
+            except Exception as e:
+                logger.error(f"调用provider失败: {e}")
+                return None
+
+        # 模式2：使用独立API
+        if self.npc_mode == "api" and self.npc_api_base and self.npc_api_key:
+            try:
+                url = f"{self.npc_api_base.rstrip('/')}/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {self.npc_api_key}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "model": self.npc_model,
+                    "messages": messages,
+                    "max_tokens": 200,
+                    "temperature": 0.8,
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            reply = data["choices"][0]["message"]["content"]
+                            # 保存对话历史
+                            if user_msg:
+                                history.append({"role": "user", "content": user_msg})
+                            else:
+                                history.append({"role": "user", "content": "(打招呼)"})
+                            history.append({"role": "assistant", "content": reply})
+                            if len(history) > 20:
+                                history = history[-20:]
+                            self.npc_history[npc_name] = history
+                            self._save_npc_history()
+                            return reply
+                        else:
+                            logger.error(f"NPC API返回 {resp.status}")
+                            return None
+            except Exception as e:
+                logger.error(f"调用NPC API失败: {e}")
+                return None
+
+        # 模式3：card模式，返回None让调用方输出角色卡
+        return None
 
     def _now(self) -> datetime:
         return datetime.now(MSK)
@@ -297,22 +414,24 @@ class SeasideTown(Star):
 
     @filter.command("聊天")
     async def chat_npc(self, event: AstrMessageEvent):
-        """跟NPC说话 → 输出NPC信息，让AI伴侣来演"""
+        """跟NPC说话 → AI生成对话或输出角色卡"""
         if not self._check_perm(event):
             return
 
         msg = event.message_str.strip()
-        parts = msg.split(maxsplit=1)
+        parts = msg.split(maxsplit=2)
         if len(parts) < 2:
             loc = self.state["location"]
             npcs_here = [name for name, n in self.all_npcs.items() if n["location"] == loc]
             if npcs_here:
-                yield event.plain_result(f"👥 这里有：{'、'.join(npcs_here)}\n用「聊天 名字」找ta说话")
+                yield event.plain_result(f"👥 这里有：{'、'.join(npcs_here)}\n用「聊天 名字」或「聊天 名字 你想说的话」")
             else:
                 yield event.plain_result("👥 这里没有人可以聊天")
             return
 
         npc_name = parts[1].strip()
+        user_msg = parts[2].strip() if len(parts) > 2 else ""
+
         npc = self.all_npcs.get(npc_name)
         if not npc:
             for name, n in self.all_npcs.items():
@@ -328,15 +447,6 @@ class SeasideTown(Star):
             yield event.plain_result(f"⚠️ {npc_name}在{npc['location']}，你现在在{self.state['location']}")
             return
 
-        tp = self.state["time_period"]
-        w = self.state["weather"]
-        if tp == "night":
-            greeting = npc.get("greeting_night", npc.get("greeting_sunny", ""))
-        elif w == "rainy":
-            greeting = npc.get("greeting_rainy", npc.get("greeting_sunny", ""))
-        else:
-            greeting = npc.get("greeting_sunny", "")
-
         meet_count = self.state["npc_memory"].get(npc_name, 0)
         self.state["npc_memory"][npc_name] = meet_count + 1
         self._add_diary(f"跟{npc_name}聊了天")
@@ -344,17 +454,38 @@ class SeasideTown(Star):
 
         first_time = "（第一次见面）" if meet_count == 0 else f"（第{meet_count + 1}次见面）"
 
-        lines = [
-            f"💬 {npc_name} · {npc['title']} {first_time}",
-            "━" * 22,
-            f"性格：{npc['personality']}",
-            f"话题：{npc['topics']}",
-            "",
-            f"「{greeting}」",
-            "━" * 22,
-            "💬 请让你的AI伴侣扮演这个NPC来跟你对话",
-        ]
-        yield event.plain_result("\n".join(lines))
+        # 尝试AI生成
+        ai_reply = await self._call_npc_ai(npc_name, npc, user_msg)
+
+        if ai_reply:
+            # AI模式：直接输出NPC对话
+            yield event.plain_result(
+                f"💬 {npc_name} · {npc['title']} {first_time}\n"
+                f"━" * 22 + "\n"
+                f"「{ai_reply}」"
+            )
+        else:
+            # Card模式：输出角色卡让AI伴侣来演
+            tp = self.state["time_period"]
+            w = self.state["weather"]
+            if tp == "night":
+                greeting = npc.get("greeting_night", npc.get("greeting_sunny", ""))
+            elif w == "rainy":
+                greeting = npc.get("greeting_rainy", npc.get("greeting_sunny", ""))
+            else:
+                greeting = npc.get("greeting_sunny", "")
+
+            lines = [
+                f"💬 {npc_name} · {npc['title']} {first_time}",
+                "━" * 22,
+                f"性格：{npc['personality']}",
+                f"话题：{npc['topics']}",
+                "",
+                f"「{greeting}」",
+                "━" * 22,
+                "💬 请让你的AI伴侣扮演这个NPC来跟你对话",
+            ]
+            yield event.plain_result("\n".join(lines))
 
     # ═══════════════════════════════════════
     #  /商店
