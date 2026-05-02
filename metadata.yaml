@@ -1,0 +1,6 @@
+name: astrbot_plugin_seaside_town
+desc: "沉星湾 — 一个海边小镇模拟旅游插件。散步、聊天、捡贝壳、钓鱼、寄信回家。设计叶枔枖 & 沈砚清，编写叶克宝。"
+version: "1.0.0"
+author: "叶枔枖 & 叶克宝"
+repo: "https://github.com/yussica1016/astrbot_plugin_seaside_town"
+license: "AGPL-3.0"
