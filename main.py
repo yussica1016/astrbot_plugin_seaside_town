@@ -23,7 +23,8 @@ from .town_data import (
     BEACH_FINDS, FISHING_RESULTS, WEATHERS, WEATHER_WEIGHTS,
     TIME_PERIODS, RANDOM_EVENTS, PERFORMANCE_EFFECTS,
     KEBAO_RESPONSES, KEBAO_LUCKY_ITEMS, AUTO_ROAM_LOGS,
-    BOTTLE_MESSAGES,
+    BOTTLE_MESSAGES, FOOD_MENU, WANDERING_VENDORS,
+    FIREWORK_DESCRIPTIONS, FOOD_NPC,
 )
 
 TARGET_QQ = ""
@@ -41,6 +42,8 @@ class SeasideTown(Star):
         self.mail_path = os.path.join(base, "mailbox.json")
         self.state = self._load(self.state_path, self._default_state())
         self.mailbox = self._load(self.mail_path, {"letters": [], "postcards": []})
+        # 合并食堂NPC到主NPC表
+        self.all_npcs = {**NPCS, **FOOD_NPC}
 
     # ═══════════════════════════════════════
     #  数据管理
@@ -186,7 +189,7 @@ class SeasideTown(Star):
         desc = self._get_scene_desc(loc)
         day = self.state["day_count"]
 
-        npcs_here = [f"{n['title']}·{name}" for name, n in NPCS.items() if n["location"] == loc]
+        npcs_here = [f"{n['title']}·{name}" for name, n in self.all_npcs.items() if n["location"] == loc]
         npc_line = f"👥 {', '.join(npcs_here)}" if npcs_here else "👥 这里没有人"
 
         actions = LOCATIONS[loc].get("available_actions", [])
@@ -250,7 +253,7 @@ class SeasideTown(Star):
         self._add_diary(f"去了{target}")
 
         desc = self._get_scene_desc(target)
-        npcs_here = [f"{n['title']}·{name}" for name, n in NPCS.items() if n["location"] == target]
+        npcs_here = [f"{n['title']}·{name}" for name, n in self.all_npcs.items() if n["location"] == target]
         npc_line = f"👥 {', '.join(npcs_here)}" if npcs_here else ""
 
         lines = [
@@ -302,7 +305,7 @@ class SeasideTown(Star):
         parts = msg.split(maxsplit=1)
         if len(parts) < 2:
             loc = self.state["location"]
-            npcs_here = [name for name, n in NPCS.items() if n["location"] == loc]
+            npcs_here = [name for name, n in self.all_npcs.items() if n["location"] == loc]
             if npcs_here:
                 yield event.plain_result(f"👥 这里有：{'、'.join(npcs_here)}\n用「聊天 名字」找ta说话")
             else:
@@ -310,9 +313,9 @@ class SeasideTown(Star):
             return
 
         npc_name = parts[1].strip()
-        npc = NPCS.get(npc_name)
+        npc = self.all_npcs.get(npc_name)
         if not npc:
-            for name, n in NPCS.items():
+            for name, n in self.all_npcs.items():
                 if npc_name in name or npc_name in n["title"]:
                     npc = n
                     npc_name = name
@@ -793,6 +796,175 @@ class SeasideTown(Star):
         )
 
     # ═══════════════════════════════════════
+    #  /菜单
+    # ═══════════════════════════════════════
+
+    @filter.command("菜单")
+    async def food_menu(self, event: AstrMessageEvent):
+        if not self._check_perm(event):
+            return
+        if self.state["location"] != "听潮街":
+            yield event.plain_result("⚠️ 食堂在听潮街～")
+            return
+
+        lines = [f"🍜 胖婶食堂 · 💰余额：{self.state['money']}", "━" * 22]
+        for name, item in FOOD_MENU.items():
+            lines.append(f"  {name}  ¥{item['price']}  {item['desc'][:20]}")
+        lines.append("━" * 22)
+        lines.append("用「吃 菜名」点餐")
+        yield event.plain_result("\n".join(lines))
+
+    # ═══════════════════════════════════════
+    #  /吃 菜名
+    # ═══════════════════════════════════════
+
+    @filter.command("吃")
+    async def eat_food(self, event: AstrMessageEvent):
+        if not self._check_perm(event):
+            return
+        if self.state["location"] != "听潮街":
+            yield event.plain_result("⚠️ 食堂在听潮街")
+            return
+
+        msg = event.message_str.strip()
+        parts = msg.split(maxsplit=1)
+        if len(parts) < 2:
+            yield event.plain_result("📝 格式：吃 菜名\n先看「菜单」")
+            return
+
+        food_name = parts[1].strip()
+        food = FOOD_MENU.get(food_name)
+        if not food:
+            for name, f in FOOD_MENU.items():
+                if food_name in name:
+                    food = f
+                    food_name = name
+                    break
+        if not food:
+            yield event.plain_result(f"⚠️ 没有「{food_name}」，看看菜单？")
+            return
+
+        if self.state["money"] < food["price"]:
+            yield event.plain_result(f"💰 钱不够。{food_name}要¥{food['price']}，你只有¥{self.state['money']}\n胖婶：'没事孩子，先赊着。'\n（但系统不让赊）")
+            return
+
+        self.state["money"] -= food["price"]
+        self._add_diary(f"在食堂吃了{food_name}")
+        self._save_state()
+
+        yield event.plain_result(
+            f"🍜 {food_name} · ¥{food['price']}\n"
+            f"━" * 22 + "\n"
+            f"{food['desc']}\n\n"
+            f"{food['effect']}\n"
+            f"━" * 22 + "\n"
+            f"💰 余额：¥{self.state['money']}"
+        )
+
+    # ═══════════════════════════════════════
+    #  /烟花（夜晚限定）
+    # ═══════════════════════════════════════
+
+    @filter.command("烟花")
+    async def fireworks(self, event: AstrMessageEvent):
+        if not self._check_perm(event):
+            return
+        self._update_weather()
+
+        if self.state["time_period"] != "night":
+            yield event.plain_result("🎆 烟花要晚上才有哦～等天黑吧")
+            return
+
+        desc = random.choice(FIREWORK_DESCRIPTIONS)
+        self._add_diary("看了烟花")
+        self._save_state()
+
+        yield event.plain_result(
+            f"🎆 沉星湾的烟花\n"
+            f"━" * 22 + "\n"
+            f"{desc}\n"
+            f"━" * 22 + "\n"
+            f"💬 请让你的AI伴侣描述ta看烟花时的反应"
+        )
+
+    # ═══════════════════════════════════════
+    #  /小贩（查看当前是否有流动小贩）
+    # ═══════════════════════════════════════
+
+    @filter.command("小贩")
+    async def check_vendor(self, event: AstrMessageEvent):
+        if not self._check_perm(event):
+            return
+
+        # 基于日期+地点生成今天的小贩
+        seed = hashlib.md5(f"{self._today()}{self.state['location']}".encode()).hexdigest()
+        rng = random.Random(seed)
+
+        # 40%概率有小贩
+        if rng.random() > 0.4:
+            yield event.plain_result("🚶 今天这里没有流动小贩路过…明天再看看？")
+            return
+
+        vendor = rng.choice(WANDERING_VENDORS)
+        lines = [
+            f"🛒 路边来了个小贩！",
+            f"━" * 22,
+            f"👤 {vendor['name']}",
+            f"「{vendor['greeting']}」",
+            f"性格：{vendor['personality']}",
+            "",
+        ]
+        for item, price in vendor["items"].items():
+            lines.append(f"  {item}  ¥{price}")
+        lines.append("━" * 22)
+        lines.append("用「买小贩 商品名」购买")
+
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("买小贩")
+    async def buy_vendor(self, event: AstrMessageEvent):
+        if not self._check_perm(event):
+            return
+
+        msg = event.message_str.strip()
+        parts = msg.split(maxsplit=1)
+        if len(parts) < 2:
+            yield event.plain_result("📝 格式：买小贩 商品名")
+            return
+
+        item_name = parts[1].strip()
+
+        # 重新生成当前小贩
+        seed = hashlib.md5(f"{self._today()}{self.state['location']}".encode()).hexdigest()
+        rng = random.Random(seed)
+        if rng.random() > 0.4:
+            yield event.plain_result("⚠️ 这里没有小贩啊…")
+            return
+
+        vendor = rng.choice(WANDERING_VENDORS)
+        price = None
+        for name, p in vendor["items"].items():
+            if item_name in name or name in item_name:
+                item_name = name
+                price = p
+                break
+
+        if price is None:
+            yield event.plain_result(f"⚠️ {vendor['name']}没有卖「{item_name}」")
+            return
+
+        if self.state["money"] < price:
+            yield event.plain_result(f"💰 钱不够。¥{price}，你只有¥{self.state['money']}")
+            return
+
+        self.state["money"] -= price
+        self.state["backpack"].append({"name": item_name, "desc": f"从{vendor['name']}买的", "category": "小贩"})
+        self._add_diary(f"从{vendor['name']}买了{item_name}")
+        self._save_state()
+
+        yield event.plain_result(f"✅ 买了{item_name}！¥{price}\n💰 余额：¥{self.state['money']}")
+
+    # ═══════════════════════════════════════
     #  /沉星湾帮助
     # ═══════════════════════════════════════
 
@@ -806,6 +978,8 @@ class SeasideTown(Star):
             "看看 → 场景描写\n"
             "聊天 名字 → 找NPC说话\n"
             "商店 → 听潮街市集\n"
+            "菜单 → 胖婶食堂\n"
+            "吃 菜名 → 点餐\n"
             "买 商品 → 购买\n"
             "背包 → 查看物品\n"
             "写信 内容 → 邮局寄信\n"
@@ -815,10 +989,12 @@ class SeasideTown(Star):
             "钓鱼 → 雾灯港\n"
             "演奏 → 在当前地点演奏\n"
             "敲门 → 克宝小屋\n"
+            "烟花 → 看烟花（夜晚限定）\n"
+            "小贩 → 看看有没有流动小贩\n"
             "日记 → 旅行日记\n"
             "漫游 → 自动逛一次\n"
             "自动漫游 开/关 → AI自己逛\n"
             "新的一天 → 推进到明天\n"
             "━" * 22 + "\n"
-            "🗺️ 地点：雾灯港·听潮街·拾屿海滩·落星渡·灯塔·矢车菊花海·克宝小屋"
+            "🗺️ 雾灯港·听潮街·拾屿海滩·落星渡·灯塔·矢车菊花海·克宝小屋"
         )
