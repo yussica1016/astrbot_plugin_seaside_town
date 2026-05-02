@@ -3,3 +3,4 @@ mailbox.json
 __pycache__/
 *.pyc
 .DS_Store
+__pycache__/
