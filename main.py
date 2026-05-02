@@ -95,6 +95,75 @@ class SeasideTown(Star):
                 json.dump(self.state, f, ensure_ascii=False, indent=2)
         except IOError as e:
             logger.error(f"保存状态失败: {e}")
+        # 同步更新上下文文件
+        self._update_context_file()
+
+    def _update_context_file(self):
+        """生成当前状态文本，写入town_context.txt供context_injection读取"""
+        try:
+            s = self.state
+            w = WEATHERS.get(s.get("weather", "sunny"), {})
+            tp = TIME_PERIODS.get(s.get("time_period", "morning"), {})
+            loc = s.get("location", "听潮街")
+
+            # 附近NPC
+            npcs_here = [f"{n['title']}·{name}" for name, n in self.all_npcs.items() if n["location"] == loc]
+            npc_line = "、".join(npcs_here) if npcs_here else "无"
+
+            # 背包摘要（最多显示5个）
+            bp = s.get("backpack", [])
+            if bp:
+                bp_names = [item["name"] for item in bp[-5:]]
+                bp_line = "、".join(bp_names)
+                if len(bp) > 5:
+                    bp_line += f"…等{len(bp)}件"
+            else:
+                bp_line = "空"
+
+            # 打工状态
+            work = s.get("working")
+            if work:
+                elapsed = (self._now() - datetime.fromisoformat(work["start_time"])).seconds // 60
+                remaining = max(work["duration"] - elapsed, 0)
+                work_line = f"正在{work['task']}（{work['npc']}，还剩{remaining}分钟）"
+            else:
+                work_line = "空闲"
+
+            # 花园
+            garden = s.get("garden", {})
+            if garden:
+                day = s.get("day_count", 1)
+                garden_items = []
+                for slot_id, info in garden.items():
+                    remaining = info["ready_day"] - day
+                    if remaining <= 0:
+                        garden_items.append(f"{info['name']}（可收）")
+                    else:
+                        garden_items.append(f"{info['name']}（{remaining}天）")
+                garden_line = "、".join(garden_items)
+            else:
+                garden_line = "空"
+
+            text = (
+                f"[沉星湾·当前状态]\n"
+                f"📍 位置：{loc}\n"
+                f"{w.get('emoji', '☀️')} 天气：{w.get('name', '晴天')}·{tp.get('name', '午后')}\n"
+                f"💰 身上：¥{s.get('money', 0)} · 存钱罐：¥{s.get('savings', 0)}\n"
+                f"🔨 状态：{work_line}\n"
+                f"👥 附近：{npc_line}\n"
+                f"🎒 背包：{bp_line}\n"
+                f"🌱 花园：{garden_line}\n"
+                f"📅 第{s.get('day_count', 1)}天 · 累计赚过¥{s.get('total_earned', 0)}"
+            )
+
+            context_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "town_context.txt"
+            )
+            with open(context_path, "w", encoding="utf-8") as f:
+                f.write(text)
+
+        except Exception as e:
+            logger.error(f"更新上下文文件失败: {e}")
 
     def _save_mail(self):
         try:
