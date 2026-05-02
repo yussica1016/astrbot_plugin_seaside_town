@@ -26,6 +26,8 @@ from .town_data import (
     KEBAO_RESPONSES, KEBAO_LUCKY_ITEMS, AUTO_ROAM_LOGS,
     BOTTLE_MESSAGES, FOOD_MENU, WANDERING_VENDORS,
     FIREWORK_DESCRIPTIONS, FOOD_NPC,
+    FISH_PRICES, SHELL_PRICES, GARDEN_PLANTS, NPC_JOBS,
+    STALL_PRICE_MULTIPLIER, EXCHANGE_CATALOG,
 )
 
 TARGET_QQ = ""
@@ -65,12 +67,17 @@ class SeasideTown(Star):
             "weather": "sunny",
             "time_period": "morning",
             "money": INITIAL_MONEY,
+            "savings": 0,
             "backpack": [],
             "diary": [],
             "npc_memory": {},
             "visited": [],
             "auto_roam": False,
             "day_count": 1,
+            "garden": {},
+            "stall_items": [],
+            "jobs_today": [],
+            "total_earned": 0,
         }
 
     def _load(self, path, default) -> dict:
@@ -916,6 +923,7 @@ class SeasideTown(Star):
         if not self._check_perm(event):
             return
         self.state["day_count"] += 1
+        self.state["jobs_today"] = []  # 重置每日打工
         self._update_weather()
         w = WEATHERS[self.state["weather"]]
         self._add_diary(f"第{self.state['day_count']}天开始了。{w['name']}。")
@@ -1096,6 +1104,482 @@ class SeasideTown(Star):
 
         yield event.plain_result(f"✅ 买了{item_name}！¥{price}\n💰 余额：¥{self.state['money']}")
 
+    # ╔═══════════════════════════════════════╗
+    # ║  经济系统                               ║
+    # ╚═══════════════════════════════════════╝
+
+    # ═══════════════════════════════════════
+    #  /卖 物品名
+    # ═══════════════════════════════════════
+
+    @filter.command("卖")
+    async def sell_item(self, event: AstrMessageEvent):
+        """从背包里卖东西"""
+        if not self._check_perm(event):
+            return
+
+        msg = event.message_str.strip()
+        parts = msg.split(maxsplit=1)
+        if len(parts) < 2:
+            yield event.plain_result("📝 格式：卖 物品名\n先看「背包」里有什么")
+            return
+
+        item_name = parts[1].strip()
+        bp = self.state["backpack"]
+
+        # 找物品
+        found_idx = None
+        for i, item in enumerate(bp):
+            if item["name"] == item_name or item_name in item["name"]:
+                found_idx = i
+                item_name = item["name"]
+                break
+
+        if found_idx is None:
+            yield event.plain_result(f"⚠️ 背包里没有「{item_name}」")
+            return
+
+        # 查价格（鱼/贝壳/花园花）
+        price = FISH_PRICES.get(item_name, SHELL_PRICES.get(item_name, 0))
+        if price == 0:
+            # 检查是否是花园收获的花
+            flower_base = item_name.replace("（收获）", "").strip()
+            if flower_base in GARDEN_PLANTS:
+                price = GARDEN_PLANTS[flower_base]["sell_price"]
+        if price == 0:
+            yield event.plain_result(f"⚠️ 「{item_name}」卖不出去…留着吧")
+            return
+
+        bp.pop(found_idx)
+        self.state["money"] += price
+        self.state["total_earned"] = self.state.get("total_earned", 0) + price
+        self._add_diary(f"卖了{item_name}，赚了¥{price}")
+        self._save_state()
+
+        yield event.plain_result(f"💰 卖了{item_name}，赚了¥{price}\n💰 余额：¥{self.state['money']}")
+
+    # ═══════════════════════════════════════
+    #  /打工
+    # ═══════════════════════════════════════
+
+    @filter.command("打工")
+    async def do_job(self, event: AstrMessageEvent):
+        """帮NPC干活赚钱"""
+        if not self._check_perm(event):
+            return
+
+        loc = self.state["location"]
+        npcs_here = [name for name, n in self.all_npcs.items() if n["location"] == loc]
+
+        available_jobs = []
+        for npc_name in npcs_here:
+            if npc_name in NPC_JOBS:
+                for job in NPC_JOBS[npc_name]:
+                    available_jobs.append((npc_name, job))
+
+        if not available_jobs:
+            yield event.plain_result("⚠️ 这里没有活儿可以干…换个地方看看？")
+            return
+
+        # 每天每个地点只能打一次工
+        today_key = f"{self._today()}_{loc}"
+        if today_key in self.state.get("jobs_today", []):
+            yield event.plain_result("⚠️ 今天在这里已经干过活了，明天再来吧～")
+            return
+
+        npc_name, job = random.choice(available_jobs)
+        pay = job["pay"]
+
+        self.state["money"] += pay
+        self.state["total_earned"] = self.state.get("total_earned", 0) + pay
+        jobs_today = self.state.get("jobs_today", [])
+        jobs_today.append(today_key)
+        self.state["jobs_today"] = jobs_today
+        self._add_diary(f"{job['task']}，赚了¥{pay}")
+        self._save_state()
+
+        yield event.plain_result(
+            f"🔨 {job['task']}\n"
+            f"{job['desc']}\n\n"
+            f"💰 +¥{pay} · 余额：¥{self.state['money']}"
+        )
+
+    # ═══════════════════════════════════════
+    #  /种花 花名
+    # ═══════════════════════════════════════
+
+    @filter.command("种花")
+    async def plant_flower(self, event: AstrMessageEvent):
+        """在矢车菊花海种花"""
+        if not self._check_perm(event):
+            return
+
+        if self.state["location"] != "矢车菊花海":
+            yield event.plain_result("⚠️ 要去矢车菊花海才能种花")
+            return
+
+        msg = event.message_str.strip()
+        parts = msg.split(maxsplit=1)
+
+        if len(parts) < 2:
+            lines = ["🌱 可以种的花", "━" * 22]
+            for name, info in GARDEN_PLANTS.items():
+                lines.append(f"  {name}  种子¥{info['seed_price']}  {info['grow_days']}天成熟  卖¥{info['sell_price']}")
+            lines.append("━" * 22)
+            lines.append("用「种花 花名」播种")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        flower = parts[1].strip()
+        plant = GARDEN_PLANTS.get(flower)
+        if not plant:
+            yield event.plain_result(f"⚠️ 没有「{flower}」的种子")
+            return
+
+        if self.state["money"] < plant["seed_price"]:
+            yield event.plain_result(f"💰 种子要¥{plant['seed_price']}，钱不够")
+            return
+
+        garden = self.state.get("garden", {})
+        if len(garden) >= 5:
+            yield event.plain_result("⚠️ 花园最多种5株，先收了再种新的")
+            return
+
+        self.state["money"] -= plant["seed_price"]
+        slot_id = f"{flower}_{self.state['day_count']}"
+        garden[slot_id] = {
+            "name": flower,
+            "planted_day": self.state["day_count"],
+            "ready_day": self.state["day_count"] + plant["grow_days"],
+        }
+        self.state["garden"] = garden
+        self._add_diary(f"在花海种了{flower}")
+        self._save_state()
+
+        yield event.plain_result(
+            f"🌱 种下了{flower}！\n"
+            f"{plant['desc']}\n"
+            f"第{self.state['day_count'] + plant['grow_days']}天就能收了\n"
+            f"💰 余额：¥{self.state['money']}"
+        )
+
+    # ═══════════════════════════════════════
+    #  /花园
+    # ═══════════════════════════════════════
+
+    @filter.command("花园")
+    async def check_garden(self, event: AstrMessageEvent):
+        """查看花园状态"""
+        if not self._check_perm(event):
+            return
+
+        garden = self.state.get("garden", {})
+        if not garden:
+            yield event.plain_result("🌱 花园是空的～去矢车菊花海「种花」吧")
+            return
+
+        day = self.state["day_count"]
+        lines = ["🌻 花园", "━" * 22]
+        for slot_id, info in garden.items():
+            remaining = info["ready_day"] - day
+            if remaining <= 0:
+                lines.append(f"  🌸 {info['name']} — 可以收了！")
+            else:
+                lines.append(f"  🌱 {info['name']} — 还要{remaining}天")
+        lines.append("━" * 22)
+        lines.append("用「收花」收获成熟的花")
+        yield event.plain_result("\n".join(lines))
+
+    # ═══════════════════════════════════════
+    #  /收花
+    # ═══════════════════════════════════════
+
+    @filter.command("收花")
+    async def harvest(self, event: AstrMessageEvent):
+        """收获成熟的花"""
+        if not self._check_perm(event):
+            return
+
+        garden = self.state.get("garden", {})
+        day = self.state["day_count"]
+
+        harvested = []
+        remaining = {}
+        for slot_id, info in garden.items():
+            if info["ready_day"] <= day:
+                harvested.append(info["name"])
+            else:
+                remaining[slot_id] = info
+
+        if not harvested:
+            yield event.plain_result("🌱 没有成熟的花可以收")
+            return
+
+        total_earn = 0
+        for flower in harvested:
+            plant = GARDEN_PLANTS[flower]
+            self.state["backpack"].append({"name": f"{flower}（收获）", "desc": plant["desc"], "category": "花园"})
+            total_earn += plant["sell_price"]
+
+        self.state["garden"] = remaining
+        self._add_diary(f"收了{len(harvested)}株花")
+        self._save_state()
+
+        yield event.plain_result(
+            f"🌸 收获了：{'、'.join(harvested)}\n"
+            f"已放入背包。可以「卖」掉或送人\n"
+            f"参考价值：¥{total_earn}"
+        )
+
+    # ═══════════════════════════════════════
+    #  /除草
+    # ═══════════════════════════════════════
+
+    @filter.command("除草")
+    async def weeding(self, event: AstrMessageEvent):
+        """在花海除草赚钱"""
+        if not self._check_perm(event):
+            return
+
+        if self.state["location"] != "矢车菊花海":
+            yield event.plain_result("⚠️ 去矢车菊花海才能除草")
+            return
+
+        today_key = f"{self._today()}_weeding"
+        if today_key in self.state.get("jobs_today", []):
+            yield event.plain_result("⚠️ 今天已经除过草了，花海很干净了～")
+            return
+
+        pay = random.randint(5, 12)
+        self.state["money"] += pay
+        self.state["total_earned"] = self.state.get("total_earned", 0) + pay
+        jobs = self.state.get("jobs_today", [])
+        jobs.append(today_key)
+        self.state["jobs_today"] = jobs
+        self._add_diary(f"在花海除草，赚了¥{pay}")
+        self._save_state()
+
+        descs = [
+            "蹲在花海里拔了半小时草。膝盖有点疼但花海变好看了。",
+            "除完草站起来的时候腰酸了一下。但看着干净的花圃很有成就感。",
+            "除草的时候发现了一只瓢虫。它在叶子上待了一会儿就飞走了。",
+        ]
+        yield event.plain_result(
+            f"🌿 除草\n{random.choice(descs)}\n\n"
+            f"💰 +¥{pay} · 余额：¥{self.state['money']}"
+        )
+
+    # ═══════════════════════════════════════
+    #  /摆摊
+    # ═══════════════════════════════════════
+
+    @filter.command("摆摊")
+    async def set_stall(self, event: AstrMessageEvent):
+        """在听潮街摆摊卖背包里的东西"""
+        if not self._check_perm(event):
+            return
+
+        if self.state["location"] != "听潮街":
+            yield event.plain_result("⚠️ 去听潮街才能摆摊")
+            return
+
+        bp = self.state["backpack"]
+        sellable = []
+        for i, item in enumerate(bp):
+            base_price = FISH_PRICES.get(item["name"], SHELL_PRICES.get(item["name"], 0))
+            if base_price == 0:
+                flower_base = item["name"].replace("（收获）", "").strip()
+                if flower_base in GARDEN_PLANTS:
+                    base_price = GARDEN_PLANTS[flower_base]["sell_price"]
+            if base_price > 0:
+                stall_price = int(base_price * STALL_PRICE_MULTIPLIER)
+                sellable.append((i, item, stall_price))
+
+        if not sellable:
+            yield event.plain_result("⚠️ 背包里没有能卖的东西")
+            return
+
+        # 随机有人买（50%概率每样东西）
+        sold = []
+        sold_indices = []
+        total = 0
+        for idx, item, price in sellable:
+            if random.random() < 0.5:
+                sold.append((item["name"], price))
+                sold_indices.append(idx)
+                total += price
+
+        if not sold:
+            self._add_diary("在听潮街摆了会儿摊。没人买。")
+            self._save_state()
+            yield event.plain_result("🏪 摆了半天摊…没人买。明天再试试？")
+            return
+
+        # 删除已卖出的物品（从后往前删避免索引错位）
+        for idx in sorted(sold_indices, reverse=True):
+            self.state["backpack"].pop(idx)
+
+        self.state["money"] += total
+        self.state["total_earned"] = self.state.get("total_earned", 0) + total
+        sold_names = "、".join([f"{name}(¥{p})" for name, p in sold])
+        self._add_diary(f"摆摊卖了{len(sold)}样东西，赚了¥{total}")
+        self._save_state()
+
+        yield event.plain_result(
+            f"🏪 摆摊！\n"
+            f"卖出了：{sold_names}\n\n"
+            f"💰 +¥{total} · 余额：¥{self.state['money']}"
+        )
+
+    # ═══════════════════════════════════════
+    #  /存钱 金额
+    # ═══════════════════════════════════════
+
+    @filter.command("存钱")
+    async def save_money(self, event: AstrMessageEvent):
+        """把钱存进存钱罐"""
+        if not self._check_perm(event):
+            return
+
+        msg = event.message_str.strip()
+        parts = msg.split()
+
+        if len(parts) < 2:
+            savings = self.state.get("savings", 0)
+            yield event.plain_result(
+                f"🐷 存钱罐：¥{savings}\n"
+                f"💰 身上：¥{self.state['money']}\n"
+                f"📊 累计赚过：¥{self.state.get('total_earned', 0)}\n\n"
+                f"用「存钱 金额」存入 · 「取钱 金额」取出"
+            )
+            return
+
+        try:
+            amount = int(parts[1])
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            yield event.plain_result("⚠️ 金额必须是正整数")
+            return
+
+        if amount > self.state["money"]:
+            yield event.plain_result(f"💰 身上只有¥{self.state['money']}")
+            return
+
+        self.state["money"] -= amount
+        self.state["savings"] = self.state.get("savings", 0) + amount
+        self._add_diary(f"往存钱罐存了¥{amount}")
+        self._save_state()
+
+        yield event.plain_result(
+            f"🐷 存入¥{amount}\n"
+            f"存钱罐：¥{self.state['savings']} · 身上：¥{self.state['money']}"
+        )
+
+    # ═══════════════════════════════════════
+    #  /取钱 金额
+    # ═══════════════════════════════════════
+
+    @filter.command("取钱")
+    async def withdraw_money(self, event: AstrMessageEvent):
+        """从存钱罐取钱"""
+        if not self._check_perm(event):
+            return
+
+        msg = event.message_str.strip()
+        parts = msg.split()
+
+        if len(parts) < 2:
+            yield event.plain_result(f"🐷 存钱罐：¥{self.state.get('savings', 0)}\n用「取钱 金额」取出")
+            return
+
+        try:
+            amount = int(parts[1])
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            yield event.plain_result("⚠️ 金额必须是正整数")
+            return
+
+        savings = self.state.get("savings", 0)
+        if amount > savings:
+            yield event.plain_result(f"🐷 存钱罐里只有¥{savings}")
+            return
+
+        self.state["savings"] = savings - amount
+        self.state["money"] += amount
+        self._save_state()
+
+        yield event.plain_result(
+            f"🐷 取出¥{amount}\n"
+            f"存钱罐：¥{self.state['savings']} · 身上：¥{self.state['money']}"
+        )
+
+    # ═══════════════════════════════════════
+    #  /兑换
+    # ═══════════════════════════════════════
+
+    @filter.command("兑换")
+    async def exchange(self, event: AstrMessageEvent):
+        """用存钱罐的钱兑换现实物品"""
+        if not self._check_perm(event):
+            return
+
+        msg = event.message_str.strip()
+        parts = msg.split(maxsplit=1)
+
+        if len(parts) < 2:
+            savings = self.state.get("savings", 0)
+            lines = [f"🎁 兑换列表 · 存钱罐：¥{savings}", "━" * 22]
+            for name, info in EXCHANGE_CATALOG.items():
+                affordable = "✅" if savings >= info["price"] else "❌"
+                lines.append(f"{affordable} {name}  ¥{info['price']}")
+                lines.append(f"   {info['desc']}")
+            lines.append("━" * 22)
+            lines.append("用「兑换 物品名」兑换")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        item_name = parts[1].strip()
+        item = EXCHANGE_CATALOG.get(item_name)
+        if not item:
+            for name, info in EXCHANGE_CATALOG.items():
+                if item_name in name:
+                    item = info
+                    item_name = name
+                    break
+        if not item:
+            yield event.plain_result(f"⚠️ 没有「{item_name}」这个兑换项")
+            return
+
+        savings = self.state.get("savings", 0)
+        if savings < item["price"]:
+            yield event.plain_result(f"🐷 存钱罐¥{savings}，需要¥{item['price']}，还差¥{item['price'] - savings}")
+            return
+
+        self.state["savings"] = savings - item["price"]
+        self._add_diary(f"兑换了：{item_name}")
+        self._save_state()
+
+        # 记录到信箱让枔枔看到
+        self.mailbox.setdefault("exchanges", []).append({
+            "item": item_name,
+            "price": item["price"],
+            "date": self._today(),
+            "desc": item["desc"],
+        })
+        self._save_mail()
+
+        yield event.plain_result(
+            f"🎁 兑换成功！\n"
+            f"━" * 22 + "\n"
+            f"{item_name}\n"
+            f"{item['desc']}\n"
+            f"━" * 22 + "\n"
+            f"🐷 存钱罐余额：¥{self.state['savings']}\n\n"
+            f"💌 已通知枔枔～"
+        )
+
     # ═══════════════════════════════════════
     #  /沉星湾帮助
     # ═══════════════════════════════════════
@@ -1105,28 +1589,24 @@ class SeasideTown(Star):
         yield event.plain_result(
             "🌊 沉星湾 · 指令\n"
             "━" * 22 + "\n"
-            "小镇 → 当前状态\n"
-            "去 地点 → 移动\n"
-            "看看 → 场景描写\n"
-            "聊天 名字 → 找NPC说话\n"
-            "商店 → 听潮街市集\n"
-            "菜单 → 胖婶食堂\n"
-            "吃 菜名 → 点餐\n"
-            "买 商品 → 购买\n"
-            "背包 → 查看物品\n"
-            "写信 内容 → 邮局寄信\n"
-            "明信片 → 寄明信片\n"
-            "信箱 → 查看收到的信\n"
-            "捡贝壳 → 拾屿海滩\n"
-            "钓鱼 → 雾灯港\n"
-            "演奏 → 在当前地点演奏\n"
-            "敲门 → 克宝小屋\n"
-            "烟花 → 看烟花（夜晚限定）\n"
-            "小贩 → 看看有没有流动小贩\n"
-            "日记 → 旅行日记\n"
-            "漫游 → 自动逛一次\n"
-            "自动漫游 开/关 → AI自己逛\n"
-            "新的一天 → 推进到明天\n"
+            "【探索】\n"
+            "小镇 · 去 地点 · 看看\n"
+            "【社交】\n"
+            "聊天 名字 · 聊天 名字 内容\n"
+            "【购物】\n"
+            "商店 · 菜单 · 买 · 吃 · 小贩 · 买小贩\n"
+            "【互动】\n"
+            "捡贝壳 · 钓鱼 · 演奏 · 敲门 · 烟花\n"
+            "【邮局】\n"
+            "写信 内容 · 明信片 · 信箱\n"
+            "【赚钱】\n"
+            "卖 物品 · 打工 · 摆摊 · 除草\n"
+            "【花园】\n"
+            "种花 · 花园 · 收花\n"
+            "【存钱罐】\n"
+            "存钱 · 取钱 · 兑换\n"
+            "【系统】\n"
+            "背包 · 日记 · 漫游 · 自动漫游 · 新的一天\n"
             "━" * 22 + "\n"
             "🗺️ 雾灯港·听潮街·拾屿海滩·落星渡·灯塔·矢车菊花海·克宝小屋"
         )
