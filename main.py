@@ -33,6 +33,8 @@ from .town_data import (
     LOTTERY_PRICE, LOTTERY_NAME, LOTTERY_PRIZES,
     FINANCIAL_EVENTS,
     WISH_SHOP,
+    UNLOCKABLE_LOCATIONS, UNLOCKABLE_NPCS, UNLOCKABLE_PERFORMANCE,
+    SAVINGS_MILESTONES,
 )
 
 TARGET_QQ = ""
@@ -53,7 +55,8 @@ class SeasideTown(Star):
         self.mailbox = self._load(self.mail_path, {"letters": [], "postcards": []})
         self.npc_history = self._load(self.npc_history_path, {})
         # 合并食堂NPC到主NPC表
-        self.all_npcs = {**NPCS, **FOOD_NPC}
+        self.all_npcs = {**NPCS, **FOOD_NPC, **UNLOCKABLE_NPCS}
+        self.all_performance = {**PERFORMANCE_EFFECTS, **UNLOCKABLE_PERFORMANCE}
         # 读取插件配置
         self.config = config or {}
         self.npc_mode = self.config.get("npc_mode", "card")
@@ -87,6 +90,7 @@ class SeasideTown(Star):
             "bank_day": 0,
             "lottery_history": [],
             "wish_shop_unlocked": False,
+            "unlocked_locations": [],
             "wishes": [],
         }
 
@@ -341,15 +345,17 @@ class SeasideTown(Star):
     def _resolve_location(self, name: str) -> str | None:
         if name in LOCATIONS:
             return name
+        if name in UNLOCKABLE_LOCATIONS:
+            return name
         if name in LOCATION_ALIASES:
             return LOCATION_ALIASES[name]
-        for loc in LOCATIONS:
+        for loc in list(LOCATIONS.keys()) + list(UNLOCKABLE_LOCATIONS.keys()):
             if name in loc:
                 return loc
         return None
 
     def _get_scene_desc(self, location: str) -> str:
-        loc = LOCATIONS[location]
+        loc = LOCATIONS.get(location, UNLOCKABLE_LOCATIONS.get(location, {}))
         w = self.state["weather"]
         tp = self.state["time_period"]
         if tp == "night" and "desc_night" in loc:
@@ -501,11 +507,29 @@ class SeasideTown(Star):
             yield event.plain_result(f"📍 你已经在{target}了")
             return
 
+        # 检查是否需要解锁
+        if target in UNLOCKABLE_LOCATIONS and target not in self.state.get("unlocked_locations", []):
+            info = UNLOCKABLE_LOCATIONS[target]
+            yield event.plain_result(
+                f"🔒 {target}还没解锁\n"
+                f"{info['unlock_desc']}\n"
+                f"用「兑换 解锁新地点：{target}」解锁（¥{info['unlock_price']}）"
+            )
+            return
+
         # 灯塔需要渡船
         if target == "灯塔":
             w = self.state["weather"]
             if w in LOCATIONS["落星渡"].get("ferry_blocked_weather", []):
                 yield event.plain_result(f"⚠️ {WEATHERS[w]['name']}，落星渡停航了，今天去不了灯塔。")
+                return
+
+        # 可解锁地点天气限制
+        if target in UNLOCKABLE_LOCATIONS:
+            loc_data = UNLOCKABLE_LOCATIONS[target]
+            w = self.state["weather"]
+            if w in loc_data.get("blocked_weather", []):
+                yield event.plain_result(f"⚠️ {WEATHERS[w]['name']}，今天去不了{target}。")
                 return
 
         self.state["location"] = target
@@ -946,7 +970,7 @@ class SeasideTown(Star):
             yield event.plain_result(busy)
             return
         loc = self.state["location"]
-        effect = PERFORMANCE_EFFECTS.get(loc)
+        effect = self.all_performance.get(loc)
         if not effect:
             yield event.plain_result(f"这里不太适合演奏…换个地方试试？")
             return
@@ -1902,6 +1926,10 @@ class SeasideTown(Star):
             f"存钱罐：¥{self.state['savings']} · 身上：¥{self.state['money']}"
         )
 
+        milestone = self._check_milestone()
+        if milestone:
+            yield event.plain_result(milestone)
+
     # ═══════════════════════════════════════
     #  /取钱 金额
     # ═══════════════════════════════════════
@@ -1989,6 +2017,16 @@ class SeasideTown(Star):
         # 许愿店特殊处理
         if "许愿店" in item_name:
             self.state["wish_shop_unlocked"] = True
+
+        # 通用地点解锁
+        if "解锁新地点" in item_name:
+            for loc_name in UNLOCKABLE_LOCATIONS:
+                if loc_name in item_name:
+                    unlocked = self.state.get("unlocked_locations", [])
+                    if loc_name not in unlocked:
+                        unlocked.append(loc_name)
+                    self.state["unlocked_locations"] = unlocked
+                    break
 
         self._save_state()
 
@@ -2274,11 +2312,90 @@ class SeasideTown(Star):
         )
 
     # ═══════════════════════════════════════
+    #  /泡温泉
+    # ═══════════════════════════════════════
+
+    @filter.command("泡温泉")
+    async def hot_spring(self, event: AstrMessageEvent):
+        """在温泉泡澡"""
+        if not self._check_perm(event):
+            return
+
+        if self.state["location"] != "温泉":
+            yield event.plain_result("⚠️ 要先去温泉才能泡哦～")
+            return
+
+        desc = self._get_scene_desc("温泉")
+        effect = UNLOCKABLE_LOCATIONS["温泉"].get("effect", "")
+        self._add_diary("泡了温泉。全身暖和。")
+        self._save_state()
+
+        yield event.plain_result(
+            f"♨️ 泡温泉\n"
+            f"━" * 22 + "\n"
+            f"{desc}\n\n"
+            f"{effect}\n"
+            f"━" * 22
+        )
+
+    # ═══════════════════════════════════════
+    #  /红包 金额（枔枔给沈砚清发钱）
+    # ═══════════════════════════════════════
+
+    @filter.command("红包")
+    async def red_packet(self, event: AstrMessageEvent):
+        """枔枔给沈砚清发红包"""
+        msg = event.message_str.strip()
+        parts = msg.split()
+
+        if len(parts) < 2:
+            yield event.plain_result("🧧 格式：红包 金额\n给小镇居民发红包～")
+            return
+
+        try:
+            amount = int(parts[1])
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            yield event.plain_result("⚠️ 金额必须是正整数")
+            return
+
+        self.state["money"] += amount
+        self._add_diary(f"收到枔枔的红包¥{amount}！")
+        self._save_state()
+
+        # 里程碑检查
+        milestone_msg = self._check_milestone()
+
+        reply = (
+            f"🧧 收到红包！\n"
+            f"━" * 22 + "\n"
+            f"💰 +¥{amount}\n"
+            f"余额：¥{self.state['money']}\n"
+            f"━" * 22
+        )
+        if milestone_msg:
+            reply += f"\n\n{milestone_msg}"
+
+        yield event.plain_result(reply)
+
+    def _check_milestone(self) -> str | None:
+        """检查存钱里程碑"""
+        total = self.state.get("money", 0) + self.state.get("savings", 0) + self.state.get("bank_deposit", 0)
+        result = None
+        for threshold, msg in sorted(SAVINGS_MILESTONES.items()):
+            if total >= threshold:
+                result = msg  # 取最高达到的里程碑
+        return result
+
+    # ═══════════════════════════════════════
     #  /沉星湾帮助
     # ═══════════════════════════════════════
 
     @filter.command("沉星湾帮助")
     async def town_help(self, event: AstrMessageEvent):
+        unlocked = self.state.get("unlocked_locations", [])
+        unlock_str = "、".join(unlocked) if unlocked else "无"
         yield event.plain_result(
             "🌊 沉星湾 · 指令\n"
             "━" * 22 + "\n"
@@ -2289,7 +2406,7 @@ class SeasideTown(Star):
             "【购物】\n"
             "商店 · 菜单 · 买 · 吃 · 小贩 · 买小贩\n"
             "【互动】\n"
-            "捡贝壳 · 钓鱼 · 演奏 · 敲门 · 烟花\n"
+            "捡贝壳 · 钓鱼 · 演奏 · 敲门 · 烟花 · 泡温泉\n"
             "【邮局】\n"
             "写信 内容 · 明信片 · 信箱\n"
             "【赚钱】\n"
@@ -2297,9 +2414,12 @@ class SeasideTown(Star):
             "【花园】\n"
             "种花 · 花园 · 收花\n"
             "【金融】\n"
-            "存钱 · 取钱 · 兑换 · 银行 · 彩票\n"
+            "存钱 · 取钱 · 兑换 · 银行 · 彩票 · 红包\n"
+            "【特殊】\n"
+            "许愿\n"
             "【系统】\n"
             "背包 · 日记 · 漫游 · 自动漫游 · 新的一天\n"
             "━" * 22 + "\n"
-            "🗺️ 雾灯港·听潮街·拾屿海滩·落星渡·灯塔·矢车菊花海·克宝小屋"
+            "🗺️ 基础：雾灯港·听潮街·拾屿海滩·落星渡·灯塔·矢车菊花海·克宝小屋\n"
+            f"🔓 已解锁：{unlock_str}"
         )
