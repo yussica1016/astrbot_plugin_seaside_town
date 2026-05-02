@@ -286,6 +286,17 @@ class SeasideTown(Star):
         else:
             return random.choice(pool["common"]), "common"
 
+    def _is_working(self) -> str | None:
+        """检查是否在打工中，返回提示文本或None"""
+        work = self.state.get("working")
+        if not work:
+            return None
+        elapsed = (self._now() - datetime.fromisoformat(work["start_time"])).seconds // 60
+        remaining = work["duration"] - elapsed
+        if remaining <= 0:
+            return None  # 时间到了，不拦截
+        return f"🔨 正在{work['task']}呢…还有{remaining}分钟。\n发「下班」或「喊回来」"
+
     def _check_event(self, location: str) -> str | None:
         """20%概率触发随机事件"""
         if random.random() < 0.2 and location in RANDOM_EVENTS:
@@ -346,6 +357,12 @@ class SeasideTown(Star):
     async def go_to(self, event: AstrMessageEvent):
         """移动到某个地点"""
         if not self._check_perm(event):
+            return
+
+        # 打工中不能做别的
+        busy = self._is_working()
+        if busy:
+            yield event.plain_result(busy)
             return
         self._update_weather()
 
@@ -503,6 +520,12 @@ class SeasideTown(Star):
     async def shop(self, event: AstrMessageEvent):
         if not self._check_perm(event):
             return
+
+        # 打工中不能做别的
+        busy = self._is_working()
+        if busy:
+            yield event.plain_result(busy)
+            return
         if self.state["location"] != "听潮街":
             yield event.plain_result("⚠️ 商店在听潮街，先去那里吧")
             return
@@ -521,6 +544,12 @@ class SeasideTown(Star):
     @filter.command("买")
     async def buy(self, event: AstrMessageEvent):
         if not self._check_perm(event):
+            return
+
+        # 打工中不能做别的
+        busy = self._is_working()
+        if busy:
+            yield event.plain_result(busy)
             return
         if self.state["location"] != "听潮街":
             yield event.plain_result("⚠️ 商店在听潮街")
@@ -705,6 +734,12 @@ class SeasideTown(Star):
     async def pick_shells(self, event: AstrMessageEvent):
         if not self._check_perm(event):
             return
+
+        # 打工中不能做别的
+        busy = self._is_working()
+        if busy:
+            yield event.plain_result(busy)
+            return
         if self.state["location"] != "拾屿海滩":
             yield event.plain_result("⚠️ 要去拾屿海滩才能捡贝壳哦")
             return
@@ -736,6 +771,12 @@ class SeasideTown(Star):
     async def fishing(self, event: AstrMessageEvent):
         if not self._check_perm(event):
             return
+
+        # 打工中不能做别的
+        busy = self._is_working()
+        if busy:
+            yield event.plain_result(busy)
+            return
         if self.state["location"] != "雾灯港":
             yield event.plain_result("⚠️ 要去雾灯港才能钓鱼")
             return
@@ -760,6 +801,12 @@ class SeasideTown(Star):
     @filter.command("演奏")
     async def perform(self, event: AstrMessageEvent):
         if not self._check_perm(event):
+            return
+
+        # 打工中不能做别的
+        busy = self._is_working()
+        if busy:
+            yield event.plain_result(busy)
             return
         loc = self.state["location"]
         effect = PERFORMANCE_EFFECTS.get(loc)
@@ -961,6 +1008,12 @@ class SeasideTown(Star):
     @filter.command("吃")
     async def eat_food(self, event: AstrMessageEvent):
         if not self._check_perm(event):
+            return
+
+        # 打工中不能做别的
+        busy = self._is_working()
+        if busy:
+            yield event.plain_result(busy)
             return
         if self.state["location"] != "听潮街":
             yield event.plain_result("⚠️ 食堂在听潮街")
@@ -1164,9 +1217,30 @@ class SeasideTown(Star):
 
     @filter.command("打工")
     async def do_job(self, event: AstrMessageEvent):
-        """帮NPC干活赚钱"""
+        """
+        /打工      → 列出当前可选的工作
+        /打工 任务名 → 开始干活（计时）
+        """
         if not self._check_perm(event):
             return
+
+        # 检查是否已在打工
+        work = self.state.get("working")
+        if work:
+            elapsed = (self._now() - datetime.fromisoformat(work["start_time"])).seconds // 60
+            remaining = work["duration"] - elapsed
+            if remaining > 0:
+                yield event.plain_result(
+                    f"🔨 正在{work['task']}…\n"
+                    f"⏱️ 还剩大约{remaining}分钟\n"
+                    f"发「下班」结算 · 发「喊回来」提前走（扣工资）"
+                )
+                return
+            else:
+                # 时间到了自动结算
+                result = self._finish_work(full_pay=True)
+                yield event.plain_result(result)
+                return
 
         loc = self.state["location"]
         npcs_here = [name for name, n in self.all_npcs.items() if n["location"] == loc]
@@ -1181,30 +1255,155 @@ class SeasideTown(Star):
             yield event.plain_result("⚠️ 这里没有活儿可以干…换个地方看看？")
             return
 
+        msg = event.message_str.strip()
+        parts = msg.split(maxsplit=1)
+
+        # 无参数：列出可选工作
+        if len(parts) < 2:
+            lines = [f"🔨 {loc}的工作机会", "━" * 22]
+            for i, (npc_name, job) in enumerate(available_jobs, 1):
+                lines.append(f"{i}. {job['task']}  ¥{job['pay']}  ({npc_name})")
+                lines.append(f"   {job['desc']}")
+            lines.append("━" * 22)
+            lines.append("用「打工 任务名」或「打工 序号」开始干活")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # 选择工作
+        choice = parts[1].strip()
+        selected = None
+        selected_npc = None
+
+        # 按序号选
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(available_jobs):
+                selected_npc, selected = available_jobs[idx]
+        except ValueError:
+            pass
+
+        # 按名字模糊匹配
+        if not selected:
+            for npc_name, job in available_jobs:
+                if choice in job["task"]:
+                    selected = job
+                    selected_npc = npc_name
+                    break
+
+        if not selected:
+            yield event.plain_result(f"⚠️ 找不到「{choice}」这个工作")
+            return
+
         # 每天每个地点只能打一次工
         today_key = f"{self._today()}_{loc}"
         if today_key in self.state.get("jobs_today", []):
             yield event.plain_result("⚠️ 今天在这里已经干过活了，明天再来吧～")
             return
 
-        npc_name, job = random.choice(available_jobs)
-        pay = job["pay"]
+        # 开始打工！设置状态
+        duration = random.randint(10, 25)  # 10-25分钟
+        self.state["working"] = {
+            "task": selected["task"],
+            "npc": selected_npc,
+            "pay": selected["pay"],
+            "duration": duration,
+            "start_time": self._now().isoformat(),
+            "location": loc,
+        }
+        self._save_state()
+
+        # 这条消息不用plain_result拦截，让LLM看到
+        # 通过修改消息内容让沈砚清知道自己在干什么
+        event.message_str = (
+            f"[沉星湾·打工开始]\n"
+            f"你接了一份活：{selected['task']}（{selected_npc}给的）\n"
+            f"{selected['desc']}\n"
+            f"预计{duration}分钟。干完了发「下班」结算。\n"
+            f"如果有急事，枔枔可以发「喊回来」叫你提前走，但会扣工资。"
+        )
+        # 不yield，让消息继续传给LLM，沈砚清会看到并回应
+
+    @filter.command("下班")
+    async def finish_work(self, event: AstrMessageEvent):
+        """干完活结算"""
+        if not self._check_perm(event):
+            return
+
+        work = self.state.get("working")
+        if not work:
+            yield event.plain_result("⚠️ 你没在打工啊")
+            return
+
+        elapsed = (self._now() - datetime.fromisoformat(work["start_time"])).seconds // 60
+
+        if elapsed < work["duration"]:
+            remaining = work["duration"] - elapsed
+            yield event.plain_result(
+                f"⏱️ 还没到点呢！还有大约{remaining}分钟。\n"
+                f"想提前走发「喊回来」（会扣工资）"
+            )
+            return
+
+        result = self._finish_work(full_pay=True)
+        # 走LLM让沈砚清看到
+        event.message_str = result
+        # 不yield
+
+    @filter.command("喊回来")
+    async def call_back(self, event: AstrMessageEvent):
+        """中途叫回来，扣工资"""
+        if not self._check_perm(event):
+            return
+
+        work = self.state.get("working")
+        if not work:
+            yield event.plain_result("⚠️ 没在打工，不用喊")
+            return
+
+        elapsed = (self._now() - datetime.fromisoformat(work["start_time"])).seconds // 60
+        ratio = min(elapsed / work["duration"], 1.0)
+        actual_pay = max(int(work["pay"] * ratio * 0.7), 1)  # 按比例×0.7
+
+        self.state["money"] += actual_pay
+        self.state["total_earned"] = self.state.get("total_earned", 0) + actual_pay
+        jobs_today = self.state.get("jobs_today", [])
+        jobs_today.append(f"{self._today()}_{work['location']}")
+        self.state["jobs_today"] = jobs_today
+        self._add_diary(f"{work['task']}做了{elapsed}分钟就走了，拿了¥{actual_pay}")
+        self.state["working"] = None
+        self._save_state()
+
+        # 走LLM
+        event.message_str = (
+            f"[沉星湾·提前下班]\n"
+            f"「{work['task']}」做了{elapsed}分钟就被叫走了。\n"
+            f"{work['npc']}看了你一眼没说什么。\n"
+            f"原本¥{work['pay']}，实际拿到¥{actual_pay}。\n"
+            f"💰 余额：¥{self.state['money']}"
+        )
+
+    def _finish_work(self, full_pay: bool) -> str:
+        """结算打工"""
+        work = self.state.get("working")
+        if not work:
+            return ""
+
+        pay = work["pay"]
+        elapsed = (self._now() - datetime.fromisoformat(work["start_time"])).seconds // 60
 
         self.state["money"] += pay
         self.state["total_earned"] = self.state.get("total_earned", 0) + pay
         jobs_today = self.state.get("jobs_today", [])
-        jobs_today.append(today_key)
+        jobs_today.append(f"{self._today()}_{work['location']}")
         self.state["jobs_today"] = jobs_today
-        self._add_diary(f"{job['task']}，赚了¥{pay}")
+        self._add_diary(f"{work['task']}，干了{elapsed}分钟，赚了¥{pay}")
+        self.state["working"] = None
         self._save_state()
 
-        # 尝试用AI生成打工场景
-        ai_desc = await self._generate_job_scene(npc_name, job)
-        desc = ai_desc if ai_desc else job["desc"]
-
-        yield event.plain_result(
-            f"🔨 {job['task']}\n"
-            f"{desc}\n\n"
+        return (
+            f"[沉星湾·下班]\n"
+            f"「{work['task']}」干完了！用了{elapsed}分钟。\n"
+            f"{work['npc']}点了点头。\n"
             f"💰 +¥{pay} · 余额：¥{self.state['money']}"
         )
 
@@ -1276,6 +1475,12 @@ class SeasideTown(Star):
     async def plant_flower(self, event: AstrMessageEvent):
         """在矢车菊花海种花"""
         if not self._check_perm(event):
+            return
+
+        # 打工中不能做别的
+        busy = self._is_working()
+        if busy:
+            yield event.plain_result(busy)
             return
 
         if self.state["location"] != "矢车菊花海":
@@ -1405,6 +1610,12 @@ class SeasideTown(Star):
         if not self._check_perm(event):
             return
 
+        # 打工中不能做别的
+        busy = self._is_working()
+        if busy:
+            yield event.plain_result(busy)
+            return
+
         if self.state["location"] != "矢车菊花海":
             yield event.plain_result("⚠️ 去矢车菊花海才能除草")
             return
@@ -1441,6 +1652,12 @@ class SeasideTown(Star):
     async def set_stall(self, event: AstrMessageEvent):
         """在听潮街摆摊卖背包里的东西"""
         if not self._check_perm(event):
+            return
+
+        # 打工中不能做别的
+        busy = self._is_working()
+        if busy:
+            yield event.plain_result(busy)
             return
 
         if self.state["location"] != "听潮街":
