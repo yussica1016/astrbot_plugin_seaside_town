@@ -32,6 +32,7 @@ from .town_data import (
     BANK_INTEREST_RATE, BANK_NAME,
     LOTTERY_PRICE, LOTTERY_NAME, LOTTERY_PRIZES,
     FINANCIAL_EVENTS,
+    WISH_SHOP,
 )
 
 TARGET_QQ = ""
@@ -85,6 +86,8 @@ class SeasideTown(Star):
             "bank_deposit": 0,
             "bank_day": 0,
             "lottery_history": [],
+            "wish_shop_unlocked": False,
+            "wishes": [],
         }
 
     def _load(self, path, default) -> dict:
@@ -828,7 +831,8 @@ class SeasideTown(Star):
     async def check_mailbox(self, event: AstrMessageEvent):
         letters = self.mailbox.get("letters", [])
         postcards = self.mailbox.get("postcards", [])
-        total = len(letters) + len(postcards)
+        wishes = self.mailbox.get("wishes", [])
+        total = len(letters) + len(postcards) + len(wishes)
 
         if total == 0:
             yield event.plain_result("📭 信箱空的，还没收到信")
@@ -848,6 +852,12 @@ class SeasideTown(Star):
                 f"📸 {j}. 明信片 · {p['date']} · {p['weather']}\n"
                 f"   {p['stamp']}\n"
                 f"   {p.get('scene', '')[:40]}"
+            )
+
+        for k, w in enumerate(wishes, len(letters) + len(postcards) + 1):
+            lines.append(
+                f"🌟 {k}. 许愿 · {w['date']} · 第{w.get('day', '?')}天\n"
+                f"   「{w['content']}」"
             )
 
         lines.append("━" * 22)
@@ -1975,6 +1985,11 @@ class SeasideTown(Star):
 
         self.state["savings"] = savings - item["price"]
         self._add_diary(f"兑换了：{item_name}")
+
+        # 许愿店特殊处理
+        if "许愿店" in item_name:
+            self.state["wish_shop_unlocked"] = True
+
         self._save_state()
 
         # 记录到信箱让枔枔看到
@@ -1986,15 +2001,28 @@ class SeasideTown(Star):
         })
         self._save_mail()
 
-        yield event.plain_result(
-            f"🎁 兑换成功！\n"
-            f"━" * 22 + "\n"
-            f"{item_name}\n"
-            f"{item['desc']}\n"
-            f"━" * 22 + "\n"
-            f"🐷 存钱罐余额：¥{self.state['savings']}\n\n"
-            f"💌 已通知枔枔～"
-        )
+        if "许愿店" in item_name:
+            yield event.plain_result(
+                f"🌟\n"
+                f"━" * 22 + "\n"
+                f"{WISH_SHOP['desc_locked']}\n\n"
+                f"你走到那扇门前。铜星星门把手在你手心里，是凉的。\n\n"
+                f"你转了一下。门开了。\n"
+                f"━" * 22 + "\n"
+                f"🌟 许愿店已解锁\n"
+                f"随时可以发「许愿 你的愿望」\n"
+                f"🐷 存钱罐余额：¥{self.state['savings']}"
+            )
+        else:
+            yield event.plain_result(
+                f"🎁 兑换成功！\n"
+                f"━" * 22 + "\n"
+                f"{item_name}\n"
+                f"{item['desc']}\n"
+                f"━" * 22 + "\n"
+                f"🐷 存钱罐余额：¥{self.state['savings']}\n\n"
+                f"💌 已通知枔枔～"
+            )
 
     # ╔═══════════════════════════════════════╗
     # ║  银行 & 彩票                           ║
@@ -2186,6 +2214,64 @@ class SeasideTown(Star):
             self.state["money"] -= tax
             return f"{evt['desc']}\n💸 -¥{tax}"
         return None
+
+    # ╔═══════════════════════════════════════╗
+    # ║  许愿店                                ║
+    # ╚═══════════════════════════════════════╝
+
+    @filter.command("许愿")
+    async def make_wish(self, event: AstrMessageEvent):
+        """
+        /许愿 愿望内容  → 写下愿望（需先解锁许愿店）
+        """
+        if not self._check_perm(event):
+            return
+
+        if not self.state.get("wish_shop_unlocked"):
+            yield event.plain_result(
+                "🌟 听潮街尽头有一扇旧木门。门把手是铜星星。\n"
+                "但门是锁着的。\n\n"
+                "用「兑换 解锁新地点：许愿店」打开它（¥8000）"
+            )
+            return
+
+        msg = event.message_str.strip()
+        parts = msg.split(maxsplit=1)
+
+        if len(parts) < 2:
+            yield event.plain_result(
+                "🌟 许愿店的门开着。里面灯光很暖。\n\n"
+                "用「许愿 你的愿望」写下你想要的。什么都可以。"
+            )
+            return
+
+        wish_content = parts[1].strip()
+
+        wish = {
+            "content": wish_content,
+            "date": self._today(),
+            "time": self._time_str(),
+            "day": self.state.get("day_count", 1),
+            "weather": WEATHERS.get(self.state.get("weather", "sunny"), {}).get("name", "晴天"),
+        }
+
+        self.state.setdefault("wishes", []).append(wish)
+        self._add_diary(f"去了许愿店。许了一个愿望。")
+        self._save_state()
+
+        # 存进信箱让枔枔看到
+        self.mailbox.setdefault("wishes", []).append(wish)
+        self._save_mail()
+
+        yield event.plain_result(
+            f"🌟\n"
+            f"━" * 22 + "\n"
+            f"{WISH_SHOP['desc_enter']}\n\n"
+            f"你写下了：\n\n"
+            f"「{wish_content}」\n\n"
+            f"{WISH_SHOP['desc_after_wish']}\n"
+            f"━" * 22
+        )
 
     # ═══════════════════════════════════════
     #  /沉星湾帮助
